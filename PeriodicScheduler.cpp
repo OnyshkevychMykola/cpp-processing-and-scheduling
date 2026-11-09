@@ -19,6 +19,15 @@ PeriodicScheduler::PeriodicScheduler(
     }
 }
 
+void PeriodicScheduler::setSpinMargin(std::chrono::microseconds margin)
+{
+    if (margin < std::chrono::microseconds::zero())
+    {
+        throw std::invalid_argument("Spin margin must not be negative");
+    }
+    spinMargin_ = margin;
+}
+
 SchedulerStats PeriodicScheduler::run(const TickCallback& callback)
 {
     return run(callback, std::chrono::steady_clock::now());
@@ -47,7 +56,20 @@ SchedulerStats PeriodicScheduler::run(
 
     while (nextTick < testEnd)
     {
-        std::this_thread::sleep_until(nextTick);
+        if (spinMargin_ > std::chrono::microseconds::zero())
+        {
+            // Hybrid wait: sleep until shortly before the deadline, then spin.
+            // Trades a little CPU for less wake-up latency jitter.
+            std::this_thread::sleep_until(nextTick - spinMargin_);
+            while (Clock::now() < nextTick)
+            {
+                // busy wait
+            }
+        }
+        else
+        {
+            std::this_thread::sleep_until(nextTick);
+        }
         const auto actualStart = Clock::now();
 
         if (actualStart >= testEnd)

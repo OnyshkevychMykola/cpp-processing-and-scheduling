@@ -2,6 +2,7 @@
 #include "MeasurementProcessor.hpp"
 #include "MeasurementProducer.hpp"
 #include "PeriodicScheduler.hpp"
+#include "SystemTuning.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -75,6 +76,18 @@ struct Config
     char approach = 'B';
     std::string csvPath;        // per-publication rows
     std::string summaryPath;    // one summary row appended per run
+    std::string label;          // free-form tag stored in the summary row
+
+    // Timing-consistency techniques (scheduler thread).
+    std::string timing = "sleep";   // sleep | hybrid (sleep, then spin)
+    int spinUs = 300;               // spin margin for hybrid
+    int rtPriority = 0;             // >0: SCHED_FIFO with this priority
+    int pinCpu = -1;                // >=0: pin scheduler thread to this CPU
+    bool mlockAll = false;
+    // Competing system load.
+    int stressThreads = 0;          // -1 = auto (2 x CPUs)
+    // Publication policy: withhold data older than this (0 = never).
+    int maxAgeMs = 0;
 };
 
 void printUsage(const char* program)
@@ -86,13 +99,23 @@ void printUsage(const char* program)
         << "  baseline   3 ms processing, no delays: scheduling accuracy\n"
         << "  delayed    baseline + 5% of samples delivered 20 ms late\n"
         << "  load-ramp  processing time grows 2 ms -> 20 ms over the test\n"
+        << "  stress     baseline + busy background threads on every CPU\n"
         << "Options (all take a value):\n"
         << "  --mode sleep|cpu   --sample-ms N   --tick-ms N\n"
         << "  --processing-ms N  --duration-ms N  --raw-cap N  --prepared-cap N\n"
         << "  --delay-prob P (0..1)  --delay-ms N  --ramp-to-ms N  --seed N\n"
         << "  --approach A|B     A: process inside the tick, B: separate thread (default)\n"
         << "  --csv FILE         write per-publication rows\n"
-        << "  --summary FILE     append one summary row (header added if empty)\n";
+        << "  --summary FILE     append one summary row (header added if empty)\n"
+        << "  --label TEXT       tag stored in the summary row\n"
+        << "Timing consistency:\n"
+        << "  --timing sleep|hybrid  hybrid = sleep, then spin the last --spin-us (300)\n"
+        << "  --rt-priority N    SCHED_FIFO priority for the scheduler thread (0 = off)\n"
+        << "  --pin-cpu N        pin scheduler thread to CPU N; load avoids it\n"
+        << "  --mlock 0|1        mlockall to avoid page faults\n"
+        << "  --stress N|auto    N busy background threads (auto = 2 x CPUs)\n"
+        << "Publication policy:\n"
+        << "  --max-age-ms N     do not publish data older than N ms (0 = always)\n";
 }
 
 bool applyScenario(Config& c, const std::string& name)
@@ -118,6 +141,12 @@ bool applyScenario(Config& c, const std::string& name)
     {
         c.processingMs = 2;
         c.rampToMs = 20;
+        return true;
+    }
+    if (name == "stress")
+    {
+        c.processingMs = 3;
+        c.stressThreads = -1;
         return true;
     }
     return false;
@@ -191,6 +220,25 @@ bool parseArgs(int argc, char* argv[], Config& c)
             }
             else if (a == "--csv") c.csvPath = v;
             else if (a == "--summary") c.summaryPath = v;
+            else if (a == "--label") c.label = v;
+            else if (a == "--timing")
+            {
+                if (v != "sleep" && v != "hybrid")
+                {
+                    std::cerr << "Timing must be sleep or hybrid\n";
+                    return false;
+                }
+                c.timing = v;
+            }
+            else if (a == "--spin-us") c.spinUs = std::stoi(v);
+            else if (a == "--rt-priority") c.rtPriority = std::stoi(v);
+            else if (a == "--pin-cpu") c.pinCpu = std::stoi(v);
+            else if (a == "--mlock") c.mlockAll = std::stoi(v) != 0;
+            else if (a == "--stress")
+            {
+                c.stressThreads = v == "auto" ? -1 : std::stoi(v);
+            }
+            else if (a == "--max-age-ms") c.maxAgeMs = std::stoi(v);
             else
             {
                 std::cerr << "Unknown option: " << a << '\n';
@@ -207,7 +255,9 @@ bool parseArgs(int argc, char* argv[], Config& c)
     if (c.sampleIntervalMs <= 0 || c.tickIntervalMs <= 0 ||
         c.durationMs <= 0 || c.processingMs < 0 || c.rampToMs < 0 ||
         c.rawCapacity <= 0 || c.preparedCapacity <= 0 || c.delayMs < 0 ||
-        c.delayProbability < 0.0 || c.delayProbability > 1.0)
+        c.delayProbability < 0.0 || c.delayProbability > 1.0 ||
+        c.spinUs < 0 || c.rtPriority < 0 || c.rtPriority > 99 ||
+        c.pinCpu < -1 || c.stressThreads < -1 || c.maxAgeMs < 0)
     {
         std::cerr << "Option value out of range\n";
         return false;
@@ -251,12 +301,34 @@ int main(int argc, char* argv[])
                               testDuration);
     }
 
+    if (config.timing == "hybrid")
+    {
+        scheduler.setSpinMargin(std::chrono::microseconds(config.spinUs));
+    }
+
+    // Competing system load, started first. With --pin-cpu it avoids that CPU
+    // (an "isolated core"), otherwise it runs everywhere.
+    const int stressThreads = config.stressThreads < 0
+                                  ? 2 * availableCpuCount()
+                                  : config.stressThreads;
+    BackgroundLoad load(stressThreads, config.pinCpu);
+
     // Producer, processor and scheduler share the same virtual time origin.
-    const auto sharedStart = Clock::now() + 100ms;
+    // The longer lead-in lets the load threads settle before the first tick.
+    const auto sharedStart = Clock::now() + (stressThreads > 0 ? 300ms : 100ms);
     producer.start(sharedStart);
     if (approachB)
     {
         processor.start(sharedStart);
+    }
+
+    // Tune only the scheduler (this) thread, after the workers were created so
+    // they do not inherit its real-time class or CPU pin.
+    const TuningResult tuning =
+        tuneCurrentThread(config.rtPriority, config.pinCpu, config.mlockAll);
+    if (!tuning.notes.empty())
+    {
+        std::cerr << "Warning: " << tuning.notes << '\n';
     }
 
     std::vector<Publication> publications;
@@ -264,6 +336,8 @@ int main(int argc, char* argv[])
 
     std::optional<Measurement> lastPublishedData;
     std::size_t ticksWithoutPreparedData = 0;
+    std::size_t ticksWithoutNewData = 0;
+    std::size_t withheldPublications = 0;
     std::size_t reusedPublications = 0;
     LatencyStats publicationLateness;
     LatencyStats dataAge;
@@ -299,6 +373,11 @@ int main(int argc, char* argv[])
                 }
             }
 
+            if (!newlyPrepared)
+            {
+                ++ticksWithoutNewData;  // buffer underrun
+            }
+
             if (newlyPrepared)
             {
                 lastPublishedData = *newlyPrepared;
@@ -313,10 +392,6 @@ int main(int argc, char* argv[])
             // Our demo policy: publish on each tick, repeating the last
             // prepared measurement when there is no new one.
             const bool reused = !newlyPrepared.has_value();
-            if (reused)
-            {
-                ++reusedPublications;
-            }
 
             const auto publicationTime = Clock::now();
             const auto scheduledTime =
@@ -330,6 +405,17 @@ int main(int argc, char* argv[])
                 toMilliseconds(publicationTime - scheduledTime);
             const double dataAgeMs =
                 toMilliseconds(publicationTime - sampleTime);
+
+            // Policy: better to publish nothing than data that is too old.
+            if (config.maxAgeMs > 0 && dataAgeMs > config.maxAgeMs)
+            {
+                ++withheldPublications;
+                return;
+            }
+            if (reused)
+            {
+                ++reusedPublications;
+            }
 
             publicationLateness.add(latenessMs);
             dataAge.add(dataAgeMs);
@@ -377,10 +463,8 @@ int main(int argc, char* argv[])
 
     // Buffer underrun: the publisher tick found no NEW prepared sample
     // (either nothing was ever ready, or the last value had to be repeated).
-    const std::size_t publisherUnderruns =
-        ticksWithoutPreparedData + reusedPublications;
-    const std::size_t totalTicks = publisherUnderruns +
-                                   (publications.size() - reusedPublications);
+    const std::size_t publisherUnderruns = ticksWithoutNewData;
+    const std::size_t totalTicks = schedulerStats.executedTicks;
     const double underrunPercent =
         totalTicks ? 100.0 * static_cast<double>(publisherUnderruns) /
                          static_cast<double>(totalTicks)
@@ -407,6 +491,17 @@ int main(int argc, char* argv[])
               << (mode == ProcessingMode::CpuWork ? "CpuWork" : "Sleep") << '\n'
               << "Produced samples: " << producer.producedSamples() << '\n'
               << "Delayed samples (injected): " << producer.delayedSamples() << '\n'
+              << "Timing: " << config.timing
+              << (config.timing == "hybrid"
+                      ? " (spin " + std::to_string(config.spinUs) + " us)"
+                      : std::string())
+              << " | RT " << (tuning.realtimeApplied ? "on" : "off")
+              << " | pin "
+              << (tuning.pinApplied ? std::to_string(config.pinCpu) : "off")
+              << " | mlock " << (tuning.mlockApplied ? "on" : "off")
+              << " | stress threads " << stressThreads << '\n'
+              << "Withheld publications (data older than "
+              << config.maxAgeMs << " ms): " << withheldPublications << '\n'
               << "Buffer underruns (publisher, no new data): "
               << publisherUnderruns << " (" << underrunPercent << "% of ticks)\n"
               << "Buffer underruns (processor input empty): ";
@@ -498,7 +593,10 @@ int main(int argc, char* argv[])
                        "underrun_pct,raw_overflow_drops,start_late_avg_ms,"
                        "start_late_max_ms,jitter_avg_ms,jitter_p95_ms,jitter_p99_ms,"
                        "jitter_max_ms,proc_avg_ms,proc_max_ms,pub_late_avg_ms,"
-                       "pub_late_max_ms,data_age_avg_ms,data_age_max_ms\n";
+                       "pub_late_max_ms,data_age_avg_ms,data_age_max_ms,label,"
+                       "timing,spin_us,rt_requested,rt_applied,pin_cpu,"
+                       "pin_applied,mlock_applied,stress_threads,max_age_ms,"
+                       "withheld\n";
         }
         const auto& t = schedulerStats.timing;
         summary << config.scenario << ',' << config.approach << ','
@@ -520,7 +618,13 @@ int main(int argc, char* argv[])
                 << processing.averageMs() << ',' << processing.maximumMs << ','
                 << publicationLateness.averageMs() << ','
                 << publicationLateness.maximumMs << ','
-                << dataAge.averageMs() << ',' << dataAge.maximumMs << '\n';
+                << dataAge.averageMs() << ',' << dataAge.maximumMs << ','
+                << config.label << ',' << config.timing << ',' << config.spinUs
+                << ',' << (config.rtPriority > 0 ? 1 : 0) << ','
+                << (tuning.realtimeApplied ? 1 : 0) << ',' << config.pinCpu << ','
+                << (tuning.pinApplied ? 1 : 0) << ','
+                << (tuning.mlockApplied ? 1 : 0) << ',' << stressThreads << ','
+                << config.maxAgeMs << ',' << withheldPublications << '\n';
         if (!summary)
         {
             std::cerr << "Failed to write " << config.summaryPath << '\n';

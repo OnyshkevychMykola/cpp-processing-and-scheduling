@@ -47,6 +47,10 @@ public:
     PeriodicScheduler(std::chrono::milliseconds tickInterval,
                       std::chrono::milliseconds duration);
 
+    // Hybrid wait: sleep until `margin` before each deadline, then busy-wait
+    // the remainder. Zero (default) = plain sleep_until. Call before run().
+    void setSpinMargin(std::chrono::microseconds margin);
+
     SchedulerStats run(const TickCallback& callback);
     SchedulerStats run(const TickCallback& callback,
                        std::chrono::steady_clock::time_point startTime);
@@ -54,4 +58,5 @@ public:
 private:
     std::chrono::milliseconds tickInterval_;
     std::chrono::milliseconds duration_;
+    std::chrono::microseconds spinMargin_{0};
 };
