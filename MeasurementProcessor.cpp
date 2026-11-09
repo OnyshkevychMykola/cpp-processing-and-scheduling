@@ -43,6 +43,37 @@ void doCpuWorkFor(std::chrono::milliseconds duration)
 }
 } // namespace
 
+void simulateProcessing(ProcessingMode mode, std::chrono::milliseconds duration)
+{
+    if (mode == ProcessingMode::Sleep)
+    {
+        std::this_thread::sleep_for(duration);
+    }
+    else
+    {
+        doCpuWorkFor(duration);
+    }
+}
+
+std::chrono::milliseconds rampedProcessingTime(
+    std::chrono::milliseconds base,
+    std::chrono::milliseconds finalTime,
+    std::chrono::milliseconds rampDuration,
+    std::int64_t simulationTimeMs)
+{
+    if (rampDuration <= std::chrono::milliseconds::zero())
+    {
+        return base;
+    }
+    const double progress = std::clamp(
+        static_cast<double>(simulationTimeMs) /
+            static_cast<double>(rampDuration.count()),
+        0.0, 1.0);
+    const double ms = static_cast<double>(base.count()) +
+                      progress * static_cast<double>((finalTime - base).count());
+    return std::chrono::milliseconds(static_cast<std::int64_t>(ms + 0.5));
+}
+
 MeasurementProcessor::MeasurementProcessor(
     MeasurementBuffer& rawBuffer,
     MeasurementBuffer& preparedBuffer,
@@ -62,6 +93,22 @@ MeasurementProcessor::MeasurementProcessor(
 MeasurementProcessor::~MeasurementProcessor()
 {
     stop();
+}
+
+void MeasurementProcessor::setLoadRamp(
+    std::chrono::milliseconds finalTime, std::chrono::milliseconds rampDuration)
+{
+    if (worker_.joinable())
+    {
+        throw std::logic_error("Configure load ramp before start()");
+    }
+    if (finalTime < std::chrono::milliseconds::zero() ||
+        rampDuration <= std::chrono::milliseconds::zero())
+    {
+        throw std::invalid_argument("Invalid load ramp configuration");
+    }
+    rampFinalTime_ = finalTime;
+    rampDuration_ = rampDuration;
 }
 
 void MeasurementProcessor::start(Clock::time_point simulationStart)
@@ -116,16 +163,11 @@ void MeasurementProcessor::run(Clock::time_point simulationStart)
 
         const auto processingStart = Clock::now();
 
-        // Select one of two processing modes; the rest of the pipeline is
-        // identical so the scheduler's timing can be compared fairly.
-        if (mode_ == ProcessingMode::Sleep)
-        {
-            std::this_thread::sleep_for(processingTime_);
-        }
-        else
-        {
-            doCpuWorkFor(processingTime_);
-        }
+        // Current workload: constant, or linearly ramped up over time.
+        simulateProcessing(
+            mode_,
+            rampedProcessingTime(processingTime_, rampFinalTime_,
+                                 rampDuration_, simulationTimeMs));
 
         // Preserve the source timestamp. Ready time is not sample time.
         // A real processor could transform value here.

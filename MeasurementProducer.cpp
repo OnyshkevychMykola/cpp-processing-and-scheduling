@@ -1,6 +1,7 @@
 #include "MeasurementProducer.hpp"
 
 #include <cstdint>
+#include <random>
 #include <stdexcept>
 #include <thread>
 
@@ -18,6 +19,28 @@ MeasurementProducer::MeasurementProducer(
 MeasurementProducer::~MeasurementProducer()
 {
     stop();
+}
+
+void MeasurementProducer::setDeliveryDelay(
+    double probability, std::chrono::milliseconds delay, unsigned seed)
+{
+    if (worker_.joinable())
+    {
+        throw std::logic_error("Configure delay before start()");
+    }
+    if (probability < 0.0 || probability > 1.0 ||
+        delay < std::chrono::milliseconds::zero())
+    {
+        throw std::invalid_argument("Invalid delay configuration");
+    }
+    delayProbability_ = probability;
+    delay_ = delay;
+    seed_ = seed;
+}
+
+std::size_t MeasurementProducer::delayedSamples() const
+{
+    return delayedSamples_.load();
 }
 
 void MeasurementProducer::start(
@@ -53,6 +76,8 @@ void MeasurementProducer::run(
     std::chrono::steady_clock::time_point simulationStart)
 {
     std::int64_t sampleIndex = 0;
+    std::mt19937 rng(seed_);
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
 
     while (!stopRequested_.load())
     {
@@ -68,6 +93,12 @@ void MeasurementProducer::run(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 scheduledTime - simulationStart
             ).count();
+
+        if (delayProbability_ > 0.0 && uniform(rng) < delayProbability_)
+        {
+            ++delayedSamples_;
+            std::this_thread::sleep_for(delay_);
+        }
 
         buffer_.push({100 + static_cast<int>(sampleIndex % 1000), timestampMs});
         ++sampleIndex;
