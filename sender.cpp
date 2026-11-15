@@ -4,7 +4,8 @@
 // File mode (default): cut <file> into --chunk byte packets and send it once.
 // Channel mode (--channels N): emulate an ECG-like frontend. Every tick takes one
 // 2-byte sample from each of N channels and sends them as one packet, for --duration
-// seconds. Each channel reads <file> the way DDPS ChildMetricReader does:
+// seconds. <file> is either one file for all channels or a comma-separated list with
+// one file per channel. Each channel reads its file the way DDPS ChildMetricReader does:
 //   --read per-tick  one std::ifstream per channel, read() on every tick (default)
 //   --read preload   whole file loaded into memory up front (baseline)
 //
@@ -281,16 +282,49 @@ int runFileMode(const Options& options, SerialPort& port)
     return 0;
 }
 
+// "a.bin,b.bin,c.bin" -> {"a.bin", "b.bin", "c.bin"}
+std::vector<std::string> splitList(const std::string& list)
+{
+    std::vector<std::string> items;
+    std::size_t start = 0;
+    while (true)
+    {
+        const auto comma = list.find(',', start);
+        items.push_back(list.substr(start, comma - start));
+        if (comma == std::string::npos)
+            return items;
+        start = comma + 1;
+    }
+}
+
 int runChannelMode(const Options& options, SerialPort& port)
 {
-    const auto fileData = readFile(options.file);
+    // One file for every channel, or a comma-separated list with one file per channel.
+    auto files = splitList(options.file);
+    if (files.size() == 1)
+    {
+        files.assign(options.channels, files.front());
+    }
+    if (files.size() != options.channels)
+    {
+        throw std::runtime_error("got " + std::to_string(files.size()) + " files for " +
+                                 std::to_string(options.channels) + " channels");
+    }
+
+    std::vector<std::vector<std::uint8_t>> preloaded; // owned here, referenced by MemoryChannelReader
+    preloaded.reserve(files.size());
     std::vector<std::unique_ptr<ChannelReader>> channels;
-    for (std::size_t c = 0; c < options.channels; ++c)
+    for (const auto& file : files)
     {
         if (options.preload)
-            channels.push_back(std::make_unique<MemoryChannelReader>(fileData));
+        {
+            preloaded.push_back(readFile(file));
+            channels.push_back(std::make_unique<MemoryChannelReader>(preloaded.back()));
+        }
         else
-            channels.push_back(std::make_unique<FileChannelReader>(options.file));
+        {
+            channels.push_back(std::make_unique<FileChannelReader>(file));
+        }
     }
 
     const std::chrono::milliseconds period(options.periodMs);
@@ -310,6 +344,8 @@ int runChannelMode(const Options& options, SerialPort& port)
 
     TickTimings timings;
     timings.reserve(expectedTicks + 1);
+    constexpr double SlowReadUs = 500.0;
+    std::vector<std::pair<std::size_t, double>> slowReads; // (tick index, read us)
     std::uint32_t seq = 0;
     std::uint16_t sampleCounter = 0;
 
@@ -332,6 +368,10 @@ int runChannelMode(const Options& options, SerialPort& port)
         const auto end = Clock::now();
 
         timings.readUs.push_back(microsBetween(start, afterRead));
+        if (timings.readUs.back() > SlowReadUs)
+        {
+            slowReads.push_back({tick.tickIndex, timings.readUs.back()});
+        }
         timings.writeUs.push_back(microsBetween(afterRead, end));
         timings.tickUs.push_back(microsBetween(start, end));
     });
@@ -340,6 +380,15 @@ int runChannelMode(const Options& options, SerialPort& port)
     std::cout << "sent packets=" << seq << " payload=" << packet.bytes.size() << " B\n";
     printReport(stats, timings, options.periodMs,
                 "read " + std::to_string(options.channels) + " ch (" + (options.preload ? "preload" : "per-tick") + ")");
+
+    std::cout << "slow reads (> " << SlowReadUs << " us): " << slowReads.size();
+    const std::size_t shown = std::min<std::size_t>(slowReads.size(), 15);
+    for (std::size_t i = 0; i < shown; ++i)
+    {
+        std::cout << (i == 0 ? "  at tick:us " : ", ") << slowReads[i].first << ":"
+                  << static_cast<long>(slowReads[i].second);
+    }
+    std::cout << (slowReads.size() > shown ? ", ..." : "") << "\n";
     return 0;
 }
 } // namespace
