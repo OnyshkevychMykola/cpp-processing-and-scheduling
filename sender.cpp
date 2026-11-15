@@ -7,10 +7,14 @@
 // seconds. <file> is either one file for all channels or a comma-separated list with
 // one file per channel. Each channel reads its file the way DDPS ChildMetricReader does:
 //   --read per-tick  one std::ifstream per channel, read() on every tick (default)
-//   --read preload   whole file loaded into memory up front (baseline)
+//   --read warmup    per-tick, but each ifstream fills its buffer before the first tick
+//   --read preload   whole file loaded into memory up front
+//   --read async     two chunks of --async-chunk samples per channel; the tick reads one
+//                    while a background thread refills the other (double buffering)
 //
-// Usage: sender <port> <file> [--chunk BYTES] [--period MS]
-//                             [--channels N] [--read per-tick|preload] [--duration S]
+// Usage: sender <port> <file> [--chunk BYTES] [--period MS] [--channels N]
+//                             [--read per-tick|warmup|preload|async] [--async-chunk SAMPLES]
+//                             [--duration S]
 
 #include "Frame.hpp"
 #include "Packet.hpp"
@@ -20,7 +24,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -28,8 +34,10 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace
@@ -59,6 +67,8 @@ class ChannelReader
 public:
     virtual ~ChannelReader() = default;
     virtual void readSample(std::uint8_t* out) = 0;
+    // Times the tick had to wait for data that was not ready yet (async mode only).
+    virtual std::size_t underruns() const { return 0; }
 };
 
 // Same access pattern as DDPS ChildMetricReader: own ifstream, read() per sample, seekg(0) on wrap.
@@ -74,6 +84,12 @@ public:
         {
             throw std::runtime_error("cannot read samples from " + path);
         }
+    }
+
+    // Fills the ifstream buffer now, so the first tick does not pay for it.
+    void warmUp()
+    {
+        file_.peek();
     }
 
     void readSample(std::uint8_t* out) override
@@ -123,6 +139,135 @@ private:
     std::size_t position_ = 0;
 };
 
+// Double buffering: the tick consumes one chunk from memory while a background
+// thread reads the next chunk from the file. When the current chunk runs out the
+// two swap and the used one is handed back to the thread to be refilled.
+class AsyncChannelReader final : public ChannelReader
+{
+public:
+    AsyncChannelReader(const std::string& path, std::size_t chunkSamples)
+        : path_(path),
+          sampleCount_(std::filesystem::file_size(path) / SampleBytes),
+          chunkSamples_(chunkSamples),
+          file_(path, std::ios::binary)
+    {
+        if (!file_ || sampleCount_ == 0 || chunkSamples_ == 0)
+        {
+            throw std::runtime_error("cannot read samples from " + path);
+        }
+        for (std::size_t b = 0; b < 2; ++b)
+        {
+            chunks_[b].resize(chunkSamples_ * SampleBytes);
+            fill(b);
+            ready_[b] = true;
+        }
+        loader_ = std::thread([this] { loaderLoop(); });
+    }
+
+    ~AsyncChannelReader() override
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        needFill_.notify_one();
+        loader_.join();
+    }
+
+    AsyncChannelReader(const AsyncChannelReader&) = delete;
+    AsyncChannelReader& operator=(const AsyncChannelReader&) = delete;
+
+    void readSample(std::uint8_t* out) override
+    {
+        std::copy_n(chunks_[current_].begin() + static_cast<std::ptrdiff_t>(position_ * SampleBytes),
+                    SampleBytes, out);
+        if (++position_ < chunkSamples_)
+        {
+            return;
+        }
+        // Chunk used up: give it back for refilling and switch to the other one.
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ready_[current_] = false;
+        }
+        needFill_.notify_one();
+        current_ ^= 1;
+        position_ = 0;
+        if (!ready_[current_].load(std::memory_order_acquire))
+        {
+            ++underruns_;
+            std::unique_lock<std::mutex> lock(mutex_);
+            filled_.wait(lock, [&] { return ready_[current_].load(); });
+        }
+    }
+
+    std::size_t underruns() const override { return underruns_; }
+
+private:
+    void loaderLoop()
+    {
+        // Chunks are consumed 0, 1, 0, 1, ... so they must be refilled in the same
+        // order, even when both were handed back before this thread woke up.
+        std::size_t next = 0;
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (true)
+        {
+            needFill_.wait(lock, [&] { return stop_ || !ready_[next]; });
+            if (stop_)
+            {
+                return;
+            }
+            lock.unlock();
+            fill(next); // file I/O happens off the tick thread
+            lock.lock();
+            ready_[next].store(true, std::memory_order_release);
+            filled_.notify_one();
+            next ^= 1;
+        }
+    }
+
+    // Reads the next chunkSamples_ samples of the file into chunk b, wrapping at the end.
+    void fill(std::size_t b)
+    {
+        auto* dst = reinterpret_cast<char*>(chunks_[b].data());
+        std::size_t remaining = chunkSamples_;
+        while (remaining > 0)
+        {
+            const std::size_t take = std::min(remaining, sampleCount_ - filePosition_);
+            if (!file_.read(dst, static_cast<std::streamsize>(take * SampleBytes)))
+            {
+                throw std::runtime_error("cannot read samples from " + path_);
+            }
+            dst += take * SampleBytes;
+            remaining -= take;
+            filePosition_ += take;
+            if (filePosition_ == sampleCount_)
+            {
+                filePosition_ = 0;
+                file_.seekg(0);
+            }
+        }
+    }
+
+    std::string path_;
+    std::size_t sampleCount_;
+    std::size_t chunkSamples_;
+    std::ifstream file_;          // used by the loader thread only (after construction)
+    std::size_t filePosition_ = 0;
+
+    std::array<std::vector<std::uint8_t>, 2> chunks_;
+    std::array<std::atomic<bool>, 2> ready_{};
+    std::size_t current_ = 0;     // tick thread only
+    std::size_t position_ = 0;    // tick thread only
+    std::size_t underruns_ = 0;   // tick thread only
+
+    std::mutex mutex_;
+    std::condition_variable needFill_;
+    std::condition_variable filled_;
+    bool stop_ = false;
+    std::thread loader_;
+};
+
 struct Options
 {
     std::string port;
@@ -130,7 +275,8 @@ struct Options
     std::size_t chunk = 64;
     long periodMs = 100;
     std::size_t channels = 0; // 0 = file mode
-    bool preload = false;
+    std::string readMode = "per-tick";
+    std::size_t asyncChunkSamples = 4096;
     double durationS = 10.0;
 };
 
@@ -140,8 +286,9 @@ struct Options
     {
         std::cerr << "sender: " << error << "\n";
     }
-    std::cerr << "Usage: sender <port> <file> [--chunk BYTES] [--period MS]\n"
-                 "                            [--channels N] [--read per-tick|preload] [--duration S]\n";
+    std::cerr << "Usage: sender <port> <file> [--chunk BYTES] [--period MS] [--channels N]\n"
+                 "                            [--read per-tick|warmup|preload|async] [--async-chunk SAMPLES]\n"
+                 "                            [--duration S]\n";
     std::exit(2);
 }
 
@@ -172,8 +319,11 @@ Options parseOptions(int argc, char* argv[])
                 options.channels = std::stoul(value);
             else if (arg == "--duration")
                 options.durationS = std::stod(value);
-            else if (arg == "--read" && (value == "per-tick" || value == "preload"))
-                options.preload = value == "preload";
+            else if (arg == "--async-chunk")
+                options.asyncChunkSamples = std::stoul(value);
+            else if (arg == "--read" &&
+                     (value == "per-tick" || value == "warmup" || value == "preload" || value == "async"))
+                options.readMode = value;
             else
                 usage("unknown option " + arg + " " + value);
         }
@@ -183,7 +333,8 @@ Options parseOptions(int argc, char* argv[])
         }
     }
     if (options.chunk == 0 || options.chunk > MaxPayloadBytes || options.periodMs <= 0 ||
-        options.durationS <= 0 || options.channels * SampleBytes + 8 > MaxPayloadBytes)
+        options.durationS <= 0 || options.asyncChunkSamples == 0 ||
+        options.channels * SampleBytes + 8 > MaxPayloadBytes)
     {
         usage("chunk must be 1.." + std::to_string(MaxPayloadBytes) +
               ", period and duration must be > 0, channels must fit in one payload");
@@ -314,25 +465,37 @@ int runChannelMode(const Options& options, SerialPort& port)
     std::vector<std::vector<std::uint8_t>> preloaded; // owned here, referenced by MemoryChannelReader
     preloaded.reserve(files.size());
     std::vector<std::unique_ptr<ChannelReader>> channels;
+    const std::string& mode = options.readMode;
     for (const auto& file : files)
     {
-        if (options.preload)
+        if (mode == "preload")
         {
             preloaded.push_back(readFile(file));
             channels.push_back(std::make_unique<MemoryChannelReader>(preloaded.back()));
         }
+        else if (mode == "async")
+        {
+            channels.push_back(std::make_unique<AsyncChannelReader>(file, options.asyncChunkSamples));
+        }
         else
         {
-            channels.push_back(std::make_unique<FileChannelReader>(file));
+            auto reader = std::make_unique<FileChannelReader>(file);
+            if (mode == "warmup")
+            {
+                reader->warmUp();
+            }
+            channels.push_back(std::move(reader));
         }
     }
+    const std::string modeLabel =
+        mode == "async" ? "async, chunk " + std::to_string(options.asyncChunkSamples) + " samples" : mode;
 
     const std::chrono::milliseconds period(options.periodMs);
     const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::duration<double>(options.durationS));
     const auto expectedTicks = static_cast<std::size_t>(duration / period);
 
-    std::cout << "channel mode: " << options.channels << " channels, read=" << (options.preload ? "preload" : "per-tick")
+    std::cout << "channel mode: " << options.channels << " channels, read=" << modeLabel
               << ", period " << options.periodMs << " ms, duration " << options.durationS << " s (~"
               << expectedTicks << " ticks)\n";
 
@@ -378,8 +541,16 @@ int runChannelMode(const Options& options, SerialPort& port)
     sendEndOfStream(port, seq);
 
     std::cout << "sent packets=" << seq << " payload=" << packet.bytes.size() << " B\n";
-    printReport(stats, timings, options.periodMs,
-                "read " + std::to_string(options.channels) + " ch (" + (options.preload ? "preload" : "per-tick") + ")");
+    printReport(stats, timings, options.periodMs, "read " + std::to_string(options.channels) + " ch (" + mode + ")");
+    if (mode == "async")
+    {
+        std::size_t underruns = 0;
+        for (const auto& channel : channels)
+        {
+            underruns += channel->underruns();
+        }
+        std::cout << "async underruns (tick waited for the next chunk): " << underruns << "\n";
+    }
 
     std::cout << "slow reads (> " << SlowReadUs << " us): " << slowReads.size();
     const std::size_t shown = std::min<std::size_t>(slowReads.size(), 15);

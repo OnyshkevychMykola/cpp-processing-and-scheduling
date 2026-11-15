@@ -6,7 +6,8 @@ the samples from files on every tick too slow?
 **Short answer:** on average reading is cheap (~5 µs per tick, 0.3% of the budget), but the
 tail is not: the few ticks where `std::ifstream` has to go to the kernel (first read, buffer
 refill, wrap-around) occasionally take **2–14 ms**, which misses deadlines and skips ticks.
-Preloading the channel files removes those spikes. OS wake-up jitter remains in both modes.
+Preloading the channel files removes those spikes, and so does async double buffering; warming
+up the buffer before the first tick does not. OS wake-up jitter remains in every mode.
 
 ## Setup
 - `sender --channels 8 --period 2`: every tick reads one 2-byte sample from each of 8 channels
@@ -42,13 +43,38 @@ sample 28,928 (`seekg(0)` drops the buffer, 2–6 ms), and one buffer refill per
 buffer = 8191 B ≈ every 4096 samples ≈ 8 s, 12–14 ms). All 8 channels have the same file size,
 so they refill on **the same tick**.
 
+### Run 3: four read modes, real ECG files, 3 × 60 s each (modes interleaved)
+
+- `per-tick`: `ifstream::read` on every tick (as above).
+- `warmup`: the same, but each `ifstream` fills its buffer (`peek()`) before the first tick.
+- `preload`: all 8 files in memory before the first tick (~460 KB).
+- `async`: per channel two chunks of 4096 samples; the tick reads one from memory while a
+  background thread refills the other from the file (double buffering).
+
+| mode | read avg | longest read (worst run) | reads > 500 µs (3 runs) | deadline misses (sum) | skipped ticks (sum) |
+|---|---|---|---|---|---|
+| per-tick | 5.3 µs | 11.7 ms | 6 | 8 | 23 |
+| warmup | 5.3 µs | 10.5 ms | 7 | 6 | 26 |
+| preload | 1.6 µs | 0.24 ms | 0 | **0** | 2 |
+| async | 2.1 µs | 0.68 ms | 2 | **0** | 6 |
+
+- `warmup` removes only the first-read spike; buffer refills (ticks ~16383, 20477, 24578, 28672) and
+  the wrap-around (tick ~28931) still take 3–11 ms.
+- `async` never had to wait for a chunk (0 underruns in all runs). Its longest reads (0.6–0.7 ms)
+  are at the chunk swap, where the tick thread wakes the loader thread.
+- Skipped ticks in `preload`/`async` come from late wake-ups (lateness max 1.2–1.9 ms in every mode),
+  not from reading. All 12 runs delivered every sent packet: `bad=0 gaps=0`.
+
 ## Conclusion
 - The average cost of reading per tick is negligible; the team's worry is about the **tail**, and
   there it is justified: a refill or wrap that lands on a slow syscall blocks the tick thread for
   several periods. With 2 ms periods any stall above ~2 ms is a missed deadline.
 - Preloading removes those spikes completely (max read ≤ 184 µs, no deadline misses). The data is
   small: 8 × 58 KB ≈ 460 KB for ECG, 4 × 600 KB for `NSR120`. Preloading at start is the simplest fix
-  for DDPS. Alternatives if files ever get large: read-ahead on a separate thread, or `mmap` + `mlock`.
+  for DDPS. If files ever get too large for memory, async double buffering (measured: 0 deadline
+  misses, 0 underruns) works too, at the cost of a thread and synchronization — the prototype's first
+  version refilled chunks out of order when both were handed back at once.
+- Warming up the buffer alone is not enough: it fixes only the start.
 - OS wake-up jitter (~200 µs avg, up to ~1.8 ms, occasional skipped ticks) is present in **both**
   modes and is the next limit: real-time priority (`SCHED_FIFO`), CPU pinning and an RT kernel on target.
 
@@ -57,4 +83,4 @@ so they refill on **the same tick**.
 - Cold page cache (dropping caches needs root): would make refills slower, which only strengthens the case for preloading.
 
 Reproduce (8 files, one per channel):
-`./run.sh "$(ls /path/to/ecg-{1..8}.bin | paste -sd,)" --period 2 --channels 8 --duration 60 [--read preload]`
+`./run.sh "$(ls /path/to/ecg-{1..8}.bin | paste -sd,)" --period 2 --channels 8 --duration 60 [--read per-tick|warmup|preload|async]`
