@@ -1,26 +1,41 @@
 #!/usr/bin/env bash
-# Usage: ./run.sh [sleep|cpu]   (default: sleep)
+# Builds sender + receiver, links them with a socat pty pair and sends a file.
+# Usage: ./run.sh [file] [sender options: --chunk BYTES --period MS]
 set -euo pipefail
 cd "$(dirname "$0")"
 
-mode="${1:-sleep}"
+FILE="${1:-data/SpO2_Numerics.bin}"
+shift || true
 
-case "$mode" in
-    sleep|cpu) ;;
-    *)
-        echo "Unknown mode: $mode" >&2
-        echo "Usage: $0 [sleep|cpu]" >&2
-        exit 1
-        ;;
-esac
+TTY_SENDER=/tmp/ttyHC0
+TTY_RECEIVER=/tmp/ttyHC1
 
-if [ "$#" -gt 1 ]; then
-    echo "Too many arguments" >&2
-    echo "Usage: $0 [sleep|cpu]" >&2
-    exit 1
-fi
+command -v socat >/dev/null || { echo "socat not found: sudo apt install socat" >&2; exit 1; }
 
-g++ -std=c++17 -O2 -Wall -Wextra -pedantic -pthread -o main *.cpp
+FLAGS=(-std=c++17 -O2 -Wall -Wextra -pedantic -pthread)
+g++ "${FLAGS[@]}" -o sender sender.cpp Frame.cpp SerialPort.cpp PeriodicScheduler.cpp
+g++ "${FLAGS[@]}" -o receiver receiver.cpp Frame.cpp SerialPort.cpp
 
-echo "=== Mode: $mode ==="
-./main "$mode"
+PIDS=()
+cleanup() { kill "${PIDS[@]}" 2>/dev/null || true; }
+trap cleanup EXIT
+
+# Stale links from an earlier run could point at someone else's terminal.
+rm -f "$TTY_SENDER" "$TTY_RECEIVER"
+socat pty,raw,echo=0,link="$TTY_SENDER" pty,raw,echo=0,link="$TTY_RECEIVER" &
+SOCAT_PID=$!
+PIDS+=($SOCAT_PID)
+for _ in $(seq 50); do
+    [[ -e "$TTY_SENDER" && -e "$TTY_RECEIVER" ]] && break
+    kill -0 "$SOCAT_PID" 2>/dev/null || break
+    sleep 0.1
+done
+[[ -e "$TTY_SENDER" && -e "$TTY_RECEIVER" ]] || { echo "socat failed to create the pty pair" >&2; exit 1; }
+
+./receiver "$TTY_RECEIVER" &
+RECEIVER_PID=$!
+PIDS+=($RECEIVER_PID)
+sleep 0.2 # let the receiver open its end before data flows
+
+./sender "$TTY_SENDER" "$FILE" "$@"
+wait "$RECEIVER_PID"
