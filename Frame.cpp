@@ -50,7 +50,7 @@ std::vector<std::uint8_t> encodeFrame(const Packet& packet)
     out.push_back(Marker1);
     putLE(out, static_cast<std::uint16_t>(packet.bytes.size()));
     putLE(out, packet.seq);
-    putLE(out, packet.timestampMs);
+    putLE(out, packet.timestampUs);
     out.insert(out.end(), packet.bytes.begin(), packet.bytes.end());
     putLE(out, checksum(out.data() + MarkerBytes, out.data() + out.size()));
     return out;
@@ -122,7 +122,7 @@ std::optional<Packet> FrameDecoder::next()
 
         Packet packet;
         packet.seq = getLE<std::uint32_t>(frame + 4);
-        packet.timestampMs = getLE<std::int64_t>(frame + 8);
+        packet.timestampUs = getLE<std::int64_t>(frame + 8);
         packet.bytes.assign(frame + HeaderBytes, frame + HeaderBytes + payloadLen);
         buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(frameBytes));
         return packet;

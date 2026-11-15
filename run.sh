@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Builds sender + receiver, links them with a socat pty pair and sends a file.
-# Usage: ./run.sh [file] [sender options: --chunk BYTES --period MS]
+# Usage: ./run.sh [file] [sender options]      (VERBOSE=1 prints one line per received packet)
+#   ./run.sh                                                   send the file once, 64 B every 100 ms
+#   ./run.sh data/SpO2_Numerics.bin --period 2 --channels 8 --duration 10              ECG-like, ifstream per tick
+#   ./run.sh data/SpO2_Numerics.bin --period 2 --channels 8 --duration 10 --read preload   baseline
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -32,7 +35,7 @@ for _ in $(seq 50); do
 done
 [[ -e "$TTY_SENDER" && -e "$TTY_RECEIVER" ]] || { echo "socat failed to create the pty pair" >&2; exit 1; }
 
-./receiver "$TTY_RECEIVER" &
+./receiver "$TTY_RECEIVER" ${VERBOSE:+-v} &
 RECEIVER_PID=$!
 PIDS+=($RECEIVER_PID)
 sleep 0.2 # let the receiver open its end before data flows

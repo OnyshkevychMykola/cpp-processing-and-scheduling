@@ -1,53 +1,55 @@
-// Listens on a serial port (one end of a socat pty pair), decodes packets
-// and prints what arrived. Exits after the end-of-stream packet.
+// Listens on a serial port (one end of a socat pty pair), decodes packets and
+// measures how evenly they arrive. Exits after the end-of-stream packet.
 //
-// Usage: receiver <port>
+// Usage: receiver <port> [-v]     (-v prints one line per packet)
 
 #include "Frame.hpp"
+#include "Packet.hpp"
 #include "SerialPort.hpp"
+#include "Stats.hpp"
 
 #include <array>
-#include <chrono>
 #include <exception>
 #include <iostream>
 #include <optional>
-
-namespace
-{
-std::int64_t nowMs()
-{
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-} // namespace
+#include <string>
+#include <vector>
 
 int main(int argc, char* argv[])
 {
-    if (argc != 2)
+    if (argc < 2 || argc > 3 || (argc == 3 && std::string(argv[2]) != "-v"))
     {
-        std::cerr << "Usage: receiver <port>\n";
+        std::cerr << "Usage: receiver <port> [-v]\n";
         return 2;
     }
+    const bool verbose = argc == 3;
 
     try
     {
         SerialPort port(argv[1]);
         FrameDecoder decoder;
-        std::array<std::uint8_t, 1024> buffer{};
+        std::array<std::uint8_t, 4096> buffer{};
 
         std::size_t packets = 0;
         std::size_t bytes = 0;
         std::size_t gaps = 0;
         std::optional<std::uint32_t> lastSeq;
+        std::optional<std::int64_t> lastArrivalUs;
+        std::vector<double> intervalsUs;
+        std::vector<double> latenciesUs;
+        intervalsUs.reserve(1 << 16);
+        latenciesUs.reserve(1 << 16);
 
-        auto printTotals = [&] {
-            std::cout << "packets=" << packets << " bytes=" << bytes
-                      << " bad=" << decoder.badFrames() << " gaps=" << gaps << "\n";
+        auto printTotals = [&](const char* how) {
+            std::cout << "\n=== receiver (" << how << ") ===\n"
+                      << "packets=" << packets << " bytes=" << bytes << " bad=" << decoder.badFrames()
+                      << " gaps=" << gaps << "\n";
+            printStats(std::cout, "arrival interval", intervalsUs);
+            printStats(std::cout, "delivery latency", latenciesUs);
         };
 
-        // Prints decoded packets; returns true once the end-of-stream packet arrived.
-        auto drain = [&] {
+        // Handles decoded packets; returns true once the end-of-stream packet arrived.
+        auto drain = [&](std::int64_t arrivalUs) {
             while (auto packet = decoder.next())
             {
                 if (lastSeq && packet->seq != *lastSeq + 1)
@@ -63,9 +65,18 @@ int main(int argc, char* argv[])
 
                 ++packets;
                 bytes += packet->bytes.size();
-                std::cout << "seq=" << packet->seq << " size=" << packet->bytes.size()
-                          << " latency=" << (nowMs() - packet->timestampMs) << "ms OK\n"
-                          << std::flush;
+                const double latencyUs = static_cast<double>(arrivalUs - packet->timestampUs);
+                latenciesUs.push_back(latencyUs);
+                if (lastArrivalUs)
+                {
+                    intervalsUs.push_back(static_cast<double>(arrivalUs - *lastArrivalUs));
+                }
+                lastArrivalUs = arrivalUs;
+                if (verbose)
+                {
+                    std::cout << "seq=" << packet->seq << " size=" << packet->bytes.size()
+                              << " latency=" << latencyUs << "us OK\n";
+                }
             }
             return false;
         };
@@ -74,24 +85,23 @@ int main(int argc, char* argv[])
         while (true)
         {
             const auto got = port.readSome(buffer.data(), buffer.size());
+            const auto arrivalUs = monotonicUs();
             if (got == 0)
             {
                 // No more bytes: a corrupt length may be holding back good frames.
                 bool ended = false;
                 while (!ended && decoder.skipByte())
                 {
-                    ended = drain();
+                    ended = drain(arrivalUs);
                 }
-                std::cout << (ended ? "end of stream: " : "port closed before end of stream: ");
-                printTotals();
+                printTotals(ended ? "end of stream" : "port closed before end of stream");
                 return ended ? 0 : 1;
             }
             decoder.feed(buffer.data(), got);
 
-            if (drain())
+            if (drain(arrivalUs))
             {
-                std::cout << "end of stream: ";
-                printTotals();
+                printTotals("end of stream");
                 return 0;
             }
         }

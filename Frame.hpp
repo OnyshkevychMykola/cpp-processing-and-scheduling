@@ -8,7 +8,7 @@
 #include <vector>
 
 // Wire format (little-endian):
-//   [0xAA 0x55][uint16 payloadLen][uint32 seq][int64 timestampMs][payload][uint16 checksum]
+//   [0xAA 0x55][uint16 payloadLen][uint32 seq][int64 timestampUs][payload][uint16 checksum]
 // checksum = 16-bit wrapping sum of all bytes from payloadLen through the end of the payload.
 constexpr std::size_t MaxPayloadBytes = 4096;
 
