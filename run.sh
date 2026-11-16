@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Usage: ./run.sh [sleep|cpu] [--scenario default|baseline|delayed|load-ramp] [options]
-# Run ./main with a bad argument to print the full option list.
+# Usage: ./run.sh [sleep|cpu] [--approach A|B] [--scenario NAME] [--duration-ms N]
 set -euo pipefail
 cd "$(dirname "$0")"
 

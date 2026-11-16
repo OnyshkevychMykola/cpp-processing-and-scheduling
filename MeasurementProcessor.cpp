@@ -1,35 +1,22 @@
 #include "MeasurementProcessor.hpp"
 
 #include <algorithm>
-#include <atomic>
-#include <cstdint>
 #include <stdexcept>
-#include <thread>
 
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 
 namespace
 {
-// Prevent the compiler from removing the computational workload as unused.
+// Keeps the result observable so -O2 cannot remove the busy loop.
 std::atomic<std::uint64_t> cpuWorkSink{0};
 
-// Keep the CPU busy for about "duration" of wall-clock time.
-// This is NOT a measurement of actual CPU time or a replacement for real work.
 void doCpuWorkFor(std::chrono::milliseconds duration)
 {
-    if (duration <= std::chrono::milliseconds::zero())
-    {
-        return;
-    }
-
     const auto deadline = Clock::now() + duration;
     std::uint64_t state = 0x9e3779b97f4a7c15ULL;
-
-    do
+    while (Clock::now() < deadline)
     {
-        // Small nontrivial computation. The state flows into an observable
-        // atomic result so -O2 cannot discard the work.
         for (int i = 0; i < 2048; ++i)
         {
             state ^= state << 13;
@@ -37,8 +24,6 @@ void doCpuWorkFor(std::chrono::milliseconds duration)
             state ^= state << 17;
         }
     }
-    while (Clock::now() < deadline);
-
     cpuWorkSink.store(state, std::memory_order_relaxed);
 }
 } // namespace
@@ -98,31 +83,14 @@ MeasurementProcessor::~MeasurementProcessor()
 void MeasurementProcessor::setLoadRamp(
     std::chrono::milliseconds finalTime, std::chrono::milliseconds rampDuration)
 {
-    if (worker_.joinable())
-    {
-        throw std::logic_error("Configure load ramp before start()");
-    }
-    if (finalTime < std::chrono::milliseconds::zero() ||
-        rampDuration <= std::chrono::milliseconds::zero())
-    {
-        throw std::invalid_argument("Invalid load ramp configuration");
-    }
     rampFinalTime_ = finalTime;
     rampDuration_ = rampDuration;
 }
 
 void MeasurementProcessor::start(Clock::time_point simulationStart)
 {
-    if (worker_.joinable())
-    {
-        throw std::logic_error("Processor is already running");
-    }
-
-    stats_ = {};
     stopRequested_.store(false);
-    worker_ = std::thread([this, simulationStart] {
-        run(simulationStart);
-    });
+    worker_ = std::thread([this, simulationStart] { run(simulationStart); });
 }
 
 void MeasurementProcessor::stop()
@@ -134,53 +102,30 @@ void MeasurementProcessor::stop()
     }
 }
 
-ProcessorStats MeasurementProcessor::stats() const
-{
-    return stats_;
-}
-
 void MeasurementProcessor::run(Clock::time_point simulationStart)
 {
     std::this_thread::sleep_until(simulationStart);
 
     while (!stopRequested_.load())
     {
-        const auto now = Clock::now();
         const auto simulationTimeMs =
             std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - simulationStart).count();
+                Clock::now() - simulationStart).count();
 
-        // Discard stale raw samples and take the newest currently available.
-        // Never wait for the producer while holding the buffer mutex.
-        const auto rawMeasurement = rawBuffer_.takeLatestUpTo(simulationTimeMs);
-
-        if (!rawMeasurement)
+        // Take the newest available raw sample; poll again if there is none.
+        const auto raw = rawBuffer_.takeLatestUpTo(simulationTimeMs);
+        if (!raw)
         {
-            ++stats_.emptyBufferPolls;
             std::this_thread::sleep_for(1ms);
             continue;
         }
 
-        const auto processingStart = Clock::now();
-
-        // Current workload: constant, or linearly ramped up over time.
         simulateProcessing(
             mode_,
             rampedProcessingTime(processingTime_, rampFinalTime_,
                                  rampDuration_, simulationTimeMs));
 
-        // Preserve the source timestamp. Ready time is not sample time.
-        // A real processor could transform value here.
-        preparedBuffer_.push(*rawMeasurement);
-
-        const auto processingEnd = Clock::now();
-        const double processingMs =
-            std::chrono::duration<double, std::milli>(
-                processingEnd - processingStart).count();
-
-        ++stats_.processedSamples;
-        stats_.totalProcessingMs += processingMs;
-        stats_.maximumProcessingMs =
-            std::max(stats_.maximumProcessingMs, processingMs);
+        // Keep the source timestamp: ready time is not sample time.
+        preparedBuffer_.push(*raw);
     }
 }

@@ -1,12 +1,11 @@
-# Real-Time Data Processing and Scheduling in C++ (PoC)
+# Real-Time Data Processing and Scheduling in C++ (clean version)
 
-A proof of concept that studies how **scheduling, buffering and concurrent
-processing** affect the timing accuracy and reliability of periodic data
-publication. It simulates a data source, a processing stage and a periodic
-publisher, injects delays and load, and measures jitter, deadline misses,
-buffer underruns and latency.
+A stripped-down version of the PoC on `master`, kept for reading the code. It
+has the same pipeline and the same two approaches, but no metrics, benchmarks
+or system tuning. For jitter, latency, data age and the benchmark results, see
+the `master` branch.
 
-## Architecture
+## Pipeline
 
 ```
 Producer (500 Hz) -> raw buffer -> Processor -> prepared buffer -> Scheduler (250 Hz) -> publish
@@ -14,170 +13,37 @@ Producer (500 Hz) -> raw buffer -> Processor -> prepared buffer -> Scheduler (25
 
 | Component | Files | Role |
 |---|---|---|
-| `MeasurementProducer` | `MeasurementProducer.*` | Thread that emits a sample every `--sample-ms`; can delay delivery (`--delay-prob`, `--delay-ms`). |
-| `MeasurementBuffer` | `MeasurementBuffer.hpp` | Mutex-protected bounded queue. Counts overflow drops and stale drops. |
-| `MeasurementProcessor` | `MeasurementProcessor.*` | Simulates processing (sleep or busy CPU), optionally ramping the load up over time. |
-| `PeriodicScheduler` | `PeriodicScheduler.*` | Fires a callback every tick, measures start lateness, interval jitter (avg/p95/p99/max), skipped ticks and deadline misses. Optional hybrid wait (sleep, then spin). |
-| `SystemTuning` | `SystemTuning.*` | Linux-only helpers: pin to a CPU, `SCHED_FIFO`, `mlockall`, and busy background load threads. |
-| `main.cpp` | `main.cpp` | CLI, scenarios, publication policy, statistics and CSV export. |
+| `MeasurementProducer` | `MeasurementProducer.*` | Thread that pushes a sample every 2 ms; can deliver some samples late. |
+| `MeasurementBuffer` | `MeasurementBuffer.hpp` | Mutex-protected bounded queue. Hands out the newest sample and drops older ones. |
+| `MeasurementProcessor` | `MeasurementProcessor.*` | Thread that "processes" samples (sleep or busy CPU), optionally slower over time. |
+| `PeriodicScheduler` | `PeriodicScheduler.*` | Calls a callback every 4 ms; skips ticks that are already in the past. |
+| `main.cpp` | `main.cpp` | Wires everything together and prints each publication. |
 
-All components share one time origin. The publisher never blocks on the
-processor: if no new prepared sample exists it repeats the last value.
+All parts share one time origin. The publisher never waits: if no new sample
+is ready it repeats the last value (`REPEAT` in the output).
 
-### Two approaches to processing
+## Two approaches
 
 - **A, in the tick:** the scheduler takes the newest raw sample and processes
-  it inside the tick callback. Slow processing delays the tick.
-- **B, separate thread (default):** a processor thread prepares samples; the
-  tick only picks up finished data and never waits.
-
-Select with `--approach A|B`.
+  it inside its own callback. Slow processing delays the tick, and the
+  scheduler skips the ticks it missed (gaps in the tick numbers).
+- **B, separate thread (default):** the processor thread prepares samples;
+  the tick only picks up finished data.
 
 ## Build and run
 
-Requires a C++17 compiler (tested with g++ 15 on Ubuntu/WSL2) and pthreads.
+Requires a C++17 compiler and pthreads (Linux or WSL).
 
 ```bash
-./run.sh                                  # build + run defaults (approach B, 2 s)
-./run.sh cpu --scenario load-ramp --approach A
+./run.sh                                          # approach B, default scenario
+./run.sh --approach A --scenario load-ramp        # watch the ticks get skipped
+./run.sh --approach B --scenario load-ramp        # same load, values repeat instead
+./run.sh cpu --scenario delayed --duration-ms 400
 ```
-
-`run.sh` builds with `g++ -std=c++17 -O2 -Wall -Wextra -pedantic -pthread`
-and passes all arguments to `./main`. Any invalid argument (for example
-`./main --help`) prints the full option list and exits with an error.
-
-## Scenarios
-
-| Scenario | What it does |
-|---|---|
-| `default` | 12 ms processing (slow processor, original setup). |
-| `baseline` | 3 ms processing, no delays: scheduling accuracy. |
-| `delayed` | baseline + 5% of samples delivered 20 ms late (late samples block the queue, so data arrives in bursts). |
-| `load-ramp` | Processing time grows from 2 ms to 20 ms over the test. |
-| `stress` | baseline + busy background threads (2 per CPU) competing for the cores. |
-
-Every scenario value can be overridden by an option.
-
-## Options
 
 | Option | Meaning |
 |---|---|
-| `sleep` / `cpu`, `--mode` | Processing simulated by sleeping or by busy CPU work. |
-| `--scenario NAME` | Preset (see above). |
+| `sleep` / `cpu` | Processing simulated by sleeping or by busy CPU work. |
 | `--approach A\|B` | Where processing runs. |
-| `--sample-ms`, `--tick-ms`, `--processing-ms`, `--duration-ms` | Timing parameters. |
-| `--raw-cap`, `--prepared-cap` | Buffer capacities. |
-| `--delay-prob P`, `--delay-ms N`, `--seed N` | Delayed delivery. |
-| `--ramp-to-ms N` | Ramp processing time up to N ms. |
-| `--timing sleep\|hybrid`, `--spin-us N` | Hybrid wait: sleep, then spin the last N us (default 300). |
-| `--pin-cpu N` | Pin the scheduler thread to CPU N; background load avoids that CPU. |
-| `--rt-priority N` | `SCHED_FIFO` priority (needs `CAP_SYS_NICE`; failure is reported and ignored). |
-| `--mlock 0\|1` | `mlockall` (may fail on `RLIMIT_MEMLOCK`; reported and ignored). |
-| `--stress N\|auto` | Background busy threads (`auto` = 2 x CPUs). |
-| `--max-age-ms N` | Do not publish data older than N ms (0 = always publish). |
-| `--csv FILE` | Per-publication rows. |
-| `--summary FILE` | Append one summary row per run (header added if empty). |
-| `--label TEXT` | Tag stored in the summary row. |
-
-## Metrics
-
-| Metric | Definition |
-|---|---|
-| Interval jitter | `abs(actual interval - scheduled interval)` between consecutive executed ticks: avg, p95, p99, max. |
-| Tick start lateness | Actual tick start minus its scheduled time. |
-| Deadline miss | The callback finished after `scheduled time + tick interval`. |
-| Skipped ticks | Ticks whose time had already passed when the scheduler was free again. |
-| Buffer underrun (publisher) | A tick found no new prepared sample (the last value is repeated, or nothing is published). Reported as a count and as % of ticks. |
-| Buffer underrun (processor) | The processor polled an empty raw buffer. |
-| Processing latency | Time to process one sample. |
-| Publication lateness | Publication time minus scheduled tick time. |
-| Data age | Publication time minus the sample's own timestamp. |
-
-Note: underruns of A and B are not directly comparable, because A skips ticks
-under overload instead of repeating data. Read underruns together with
-skipped ticks.
-
-## Benchmarks
-
-Scripts run sequentially so runs do not disturb each other's timing.
-
-```bash
-./bench.sh 5 sleep 10000      # A vs B, 3 scenarios -> results/sleep/
-./bench.sh 5 cpu   10000      # same in cpu mode    -> results/cpu/
-./bench_extra.sh 5 10000 all  # timing techniques and max-age -> results/timing/, results/age/
-```
-
-Arguments: runs per configuration, mode (`bench.sh` only), duration in ms.
-`bench_extra.sh` skips the `SCHED_FIFO` configurations when they are not
-permitted; run it with `sudo` to include them.
-
-Plots need Python with `pandas` and `matplotlib`:
-
-```bash
-python plot.py results/sleep
-python plot.py results/cpu
-python plot_extra.py results
-```
-
-Each results folder contains `summary.csv` (one row per run), per-publication
-CSVs for run 1, `summary_table.md` and `fig_*.png`.
-
-## Results summary
-
-Median of 5 runs of 10 s each, WSL2, sleep mode. Details and error bars are in
-`results/`.
-
-**A (processing in the tick) vs B (separate thread), `load-ramp`:**
-
-| | A | B |
-|---|---|---|
-| Publication lateness (avg) | 9.0 ms | 0.27 ms |
-| Skipped ticks | ~1570 of 2500 | 0 |
-| Deadline misses | 724 | 0 |
-| Data age (avg) | 10.3 ms | 18.2 ms |
-| Publisher underruns | 0% | 54.5% |
-
-- B keeps publication on time; A pays with skipped ticks, B pays with repeated
-  (older) data.
-- Interval jitter p99 is similar for A and B (differences are inside the
-  run-to-run spread).
-- Delayed delivery hurts both approaches equally (data age peaks near 100 ms).
-
-**Timing consistency under CPU contention (approach B):**
-
-| Configuration | Start lateness avg | Jitter p95 | Jitter p99 | Jitter max |
-|---|---|---|---|---|
-| idle | 0.23 ms | 0.16 ms | 0.25 ms | 0.74 ms |
-| stress | 0.24 | 2.40 | 3.46 | 3.89 |
-| stress + hybrid | 0.32 | 2.83 | 3.47 | 3.96 |
-| stress + pin | 0.13 | 0.40 | 1.65 | 3.81 |
-| stress + pin + hybrid | 0.007 | 0.0001 | 0.21 | 3.06 |
-| stress + RT | 0.06 | 0.65 | 2.02 | 3.82 |
-| stress + RT + pin + hybrid | 0.010 | 0.004 | 0.50 | 3.68 |
-
-(RT = `SCHED_FIFO` priority 80, run with `sudo`; stress = 40 busy threads.)
-
-- Pinning to an isolated core helps most; combined with hybrid wait the p99
-  jitter drops to ~0.2-0.5 ms.
-- `SCHED_FIFO` alone helps less than pinning: RT priority preempts the load
-  threads, but the vCPU itself is still shared with them.
-- Spinning without isolation hurts.
-- Unpinned `stress` runs vary a lot between runs (p95 from 0.01 to 2.6 ms).
-- Rare 3-4 ms outliers remain in every configuration, including RT + pin;
-  most likely the WSL2 hypervisor preempting the vCPU (not proven).
-
-**Max-age policy under delayed delivery:** a 20 ms limit cuts the maximum
-published data age from 100 ms to 18.5 ms at the cost of 30% of ticks with
-nothing published.
-
-## Limitations
-
-- Runs are short (10 s) with only 5 repeats; treat results as orders of
-  magnitude, not precise figures.
-- Measured on WSL2 (a hypervisor sits under the Linux kernel), not on a
-  real-time OS.
-- `SCHED_FIFO` was benchmarked (with `sudo`); `mlockall` was not, because
-  `bench_extra.sh` does not pass `--mlock`. Without privileges the code
-  reports and ignores such failures.
-- Load is simulated (sleep or busy loop), not real signal processing.
-- Mutex-protected buffers; no lock-free implementation.
+| `--scenario NAME` | `default` (12 ms processing), `baseline` (3 ms), `delayed` (5% of samples 20 ms late), `load-ramp` (2 ms -> 20 ms). |
+| `--duration-ms N` | Run length, default 200 ms. |
