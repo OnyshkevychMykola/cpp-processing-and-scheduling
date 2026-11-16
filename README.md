@@ -109,7 +109,7 @@ Scripts run sequentially so runs do not disturb each other's timing.
 
 Arguments: runs per configuration, mode (`bench.sh` only), duration in ms.
 `bench_extra.sh` skips the `SCHED_FIFO` configurations when they are not
-permitted.
+permitted; run it with `sudo` to include them.
 
 Plots need Python with `pandas` and `matplotlib`:
 
@@ -147,17 +147,27 @@ Median of 5 runs of 10 s each, WSL2, sleep mode. Details and error bars are in
 
 | Configuration | Start lateness avg | Jitter p95 | Jitter p99 | Jitter max |
 |---|---|---|---|---|
-| idle | 0.22 ms | 0.20 ms | 0.30 ms | 0.64 ms |
-| stress | 0.10 | 0.26 | 3.38 | 3.85 |
-| stress + hybrid | 0.14 | 1.71 | 3.03 | 3.97 |
-| stress + pin | 0.12 | 0.12 | 1.57 | 3.84 |
-| stress + pin + hybrid | 0.03 | 0.04 | 1.90 | 3.83 |
+| idle | 0.23 ms | 0.16 ms | 0.25 ms | 0.74 ms |
+| stress | 0.24 | 2.40 | 3.46 | 3.89 |
+| stress + hybrid | 0.32 | 2.83 | 3.47 | 3.96 |
+| stress + pin | 0.13 | 0.40 | 1.65 | 3.81 |
+| stress + pin + hybrid | 0.007 | 0.0001 | 0.21 | 3.06 |
+| stress + RT | 0.06 | 0.65 | 2.02 | 3.82 |
+| stress + RT + pin + hybrid | 0.010 | 0.004 | 0.50 | 3.68 |
 
-Pinning to an isolated core helps; spinning without isolation hurts; rare
-3-4 ms outliers remain in every configuration (cause not established).
+(RT = `SCHED_FIFO` priority 80, run with `sudo`; stress = 40 busy threads.)
+
+- Pinning to an isolated core helps most; combined with hybrid wait the p99
+  jitter drops to ~0.2-0.5 ms.
+- `SCHED_FIFO` alone helps less than pinning: RT priority preempts the load
+  threads, but the vCPU itself is still shared with them.
+- Spinning without isolation hurts.
+- Unpinned `stress` runs vary a lot between runs (p95 from 0.01 to 2.6 ms).
+- Rare 3-4 ms outliers remain in every configuration, including RT + pin;
+  most likely the WSL2 hypervisor preempting the vCPU (not proven).
 
 **Max-age policy under delayed delivery:** a 20 ms limit cuts the maximum
-published data age from 96 ms to 18.5 ms at the cost of 30% of ticks with
+published data age from 100 ms to 18.5 ms at the cost of 30% of ticks with
 nothing published.
 
 ## Limitations
@@ -166,7 +176,8 @@ nothing published.
   magnitude, not precise figures.
 - Measured on WSL2 (a hypervisor sits under the Linux kernel), not on a
   real-time OS.
-- `SCHED_FIFO` and `mlockall` were not tested (insufficient privileges in the
-  test environment); the code reports and ignores such failures.
+- `SCHED_FIFO` was benchmarked (with `sudo`); `mlockall` was not, because
+  `bench_extra.sh` does not pass `--mlock`. Without privileges the code
+  reports and ignores such failures.
 - Load is simulated (sleep or busy loop), not real signal processing.
 - Mutex-protected buffers; no lock-free implementation.
